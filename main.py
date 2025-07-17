@@ -30,10 +30,8 @@ class ImageDataset(Dataset):
                  mode="train"):  ## (root = "./datasets/facades", unaligned=True:非对其数据)
         self.transform = transforms.Compose(transforms_)  ## transform变为tensor数据
         self.unaligned = unaligned
-
         self.files_A = sorted(glob.glob(os.path.join(root, "%sA" % mode) + "/*.*"))  ## "./datasets/facades/trainA/*.*"
         self.files_B = sorted(glob.glob(os.path.join(root, "%sB" % mode) + "/*.*"))  ## "./datasets/facades/trainB/*.*"
-
     def __getitem__(self, index):
         image_A = Image.open(self.files_A[index % len(self.files_A)])  ## 在A中取一张照片
 
@@ -71,7 +69,17 @@ def weights_init_normal(m):
                               0.02)  ## m.weight.data表示需要初始化的权重. nn.init.normal_():表示随机初始化采用正态分布，均值为0，标准差为0.02.
         torch.nn.init.constant_(m.bias.data, 0.0)  ## nn.init.constant_():表示将偏差定义为常量0.
 
-# CBAM
+class DSC(nn.Module):
+    def __init__(self,in_channels,out_channels,kernel_size=3,stride=1,padding=1):
+        super(DSC, self).__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding, groups=in_channels)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1)
+    def forward(self,x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+        
+# CA SA
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
         super(ChannelAttention, self).__init__()
@@ -88,6 +96,7 @@ class ChannelAttention(nn.Module):
         max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
         out = avg_out + max_out
         return self.sigmoid(out)
+        
 def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1, groups=1):
     """standard convolution with padding"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride,
@@ -95,6 +104,7 @@ def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1, 
 def conv1x1(in_planes, out_planes, stride=1):
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+    
 class PSAModule(nn.Module):
     def __init__(self, inplans, planes, conv_kernels=[3, 5, 7, 9], stride=1, conv_groups=[1, 4, 8, 16]):
         super(PSAModule, self).__init__()
@@ -139,6 +149,7 @@ class PSAModule(nn.Module):
             else:
                 out = torch.cat((x_se_weight_fp, out), dim=1)
         return out
+        
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
@@ -208,8 +219,6 @@ class GeneratorResNet(nn.Module):
             nn.ReLU(inplace=True),  ## 非线性激活
         ]
         in_features = out_features  ## in_features = 64
-
-        ## 下采样，循环2次
         for _ in range(3):
             out_features *= 2  ## out_features = 128 -> 256 -> 512
             model += [  ## (Conv + Norm + ReLU) * 2
@@ -219,12 +228,10 @@ class GeneratorResNet(nn.Module):
                 MPCSA(out_features)
             ]
             in_features = out_features  ## in_features = 128 -> 256 ->512
-
-        # 残差块儿，循环9次
+            
         for _ in range(num_residual_blocks):
             model += [ResidualBlock(out_features)]  ## model += [pad + conv + norm + relu + pad + conv + norm]
-
-        # 上采样两次
+            
         for _ in range(3):
             out_features //=2  ## out_features = 256 -> 128 -> 64
             model += [  ## model += [Upsample + conv + norm + relu]
@@ -233,8 +240,6 @@ class GeneratorResNet(nn.Module):
                 nn.ReLU(inplace=True),
             ]
             in_features = out_features  ## out_features = 256 -> 128 -> 64
-
-        ## 网络输出层  ## model += [pad + conv + tanh]
         model += [nn.ReflectionPad2d(channels),
                   nn.Conv2d(out_features, channels,kernel_size=7,stride=1),
                   nn.Tanh()]  ## 将(3)的数据每一个都映射到[-1, 1]之间
@@ -243,6 +248,7 @@ class GeneratorResNet(nn.Module):
 
     def forward(self, x):  ## 输入(1, 3, 256, 256)
         return self.model(x)  ## 输出(1, 3, 256, 256)
+        
 # Discriminator
 class Discriminator(nn.Module):
     def __init__(self, input_shape):
@@ -272,29 +278,6 @@ class Discriminator(nn.Module):
     def forward(self, img):  ## 输入(1, 3, 256, 256)
         return self.model(img)  ## 输出(1, 1, 16, 16)
 
-## 先前生成的样本的缓冲区
-class ReplayBuffer:
-    def __init__(self, max_size=50):
-        assert max_size > 0, "Empty buffer or trying to create a black hole. Be careful."
-        self.max_size = max_size
-        self.data = []
-
-    def push_and_pop(self, data):  ## 放入一张图像，再从buffer里取一张出来
-        to_return = []  ## 确保数据的随机性，判断真假图片的鉴别器识别率
-        for element in data.data:
-            element = torch.unsqueeze(element, 0)
-            if len(self.data) < self.max_size:  ## 最多放入50张，没满就一直添加
-                self.data.append(element)
-                to_return.append(element)
-            else:
-                if random.uniform(0, 1) > 0.5:  ## 满了就1/2的概率从buffer里取，或者就用当前的输入图片
-                    i = random.randint(0, self.max_size - 1)
-                    to_return.append(self.data[i].clone())
-                    self.data[i] = element
-                else:
-                    to_return.append(element)
-        return Variable(torch.cat(to_return))
-
 ## 设置学习率为初始学习率乘以给定lr_lambda函数的值
 class LambdaLR:
     def __init__(self, n_epochs, offset, decay_start_epoch):  ## (n_epochs = 50, offset = epoch, decay_start_epoch = 30)
@@ -306,7 +289,7 @@ class LambdaLR:
     def step(self, epoch):  ## return    1-max(0, epoch - 30) / (50 - 30)
         return 1.0 - max(0, epoch + self.offset - self.decay_start_epoch) / (self.n_epochs - self.decay_start_epoch)
 
-## CyclE ##
+## CycE ##
 ## 超参数配置
 parser = argparse.ArgumentParser()
 parser.add_argument("--epoch", type=int, default=0, help="epoch to start training from")
@@ -409,7 +392,7 @@ transforms_ = [
 
 ## Training data loader
 dataloader = DataLoader(  
-    ImageDataset("./dataset/datas", transforms_=transforms_, unaligned=True),
+    ImageDataset("./dataset/train", transforms_=transforms_, unaligned=True),
     ## "./datasets/facades" , unaligned:设置非对其数据
     batch_size=opt.batch_size,  ## batch_size = 1
     shuffle=True,
@@ -504,7 +487,6 @@ def train():
             optimizer_D_B.step()  ## 更新参数
             loss_D = (loss_D_A + loss_D_B) / 2
 
-            train_d += loss_D.item()
 
             ##  打印日志Log Progress
             ## 确定剩下的大约时间  假设当前 epoch = 5， i = 100
@@ -532,9 +514,6 @@ def train():
             # 每训练sample_interval张就保存一组测试集中的图片
             if batches_done % opt.sample_interval == 0 and epoch>180:
                 sample_images(batches_done)
-
-        g_loss.append(train_g/400)
-        d_loss.append(train_d/400)
         # 更新学习率
         lr_scheduler_G.step()
         lr_scheduler_D_A.step()
@@ -545,14 +524,6 @@ def train():
     # torch.save(D_A.state_dict(), "save/%s/D_A_%d.pth" % (opt.dataset_name, epoch))
     # torch.save(D_B.state_dict(), "save/%s/D_B_%d.pth" % (opt.dataset_name, epoch))
     # print("\nsave my model finished !!")
-       ## 每间隔几个epoch保存一次模型
-        if epoch>190:
-            # Save model checkpoints
-            torch.save(G_AB.state_dict(), "save/%s/G_AB_%d.pth" % (opt.dataset_name, epoch))
-            torch.save(G_BA.state_dict(), "save/%s/G_BA_%d.pth" % (opt.dataset_name, epoch))
-            torch.save(D_A.state_dict(), "save/%s/D_A_%d.pth" % (opt.dataset_name, epoch))
-            torch.save(D_B.state_dict(), "save/%s/D_B_%d.pth" % (opt.dataset_name, epoch))
-
 
 ## 函数的起始
 if __name__ == '__main__':
